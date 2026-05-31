@@ -1747,6 +1747,9 @@ def facebook_oauth_callback():
 
 
 
+@app.route("/onboarding/complete", methods=["POST"])
+@auth_required
+def complete_onboarding():
     """Mark onboarding as complete"""
     try:
         data = request.get_json()
