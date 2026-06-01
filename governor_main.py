@@ -1339,21 +1339,21 @@ def migrate_existing_data():
 
         # Add default connected platforms for first user from env vars
         instagram_token = os.getenv("INSTAGRAM_PAGE_ACCESS_TOKEN", "")
-        page_id = os.getenv("PAGE_ID", "")
-        instagram_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID", "")
+        page_id = os.getenv("PAGE_ID", "1003745256147352")
+        instagram_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID", "17841478520495248")
 
-        if instagram_token and page_id:
-            cur.execute("""
-                INSERT INTO connected_platforms (ceo_id, platform, account_id, page_id, access_token, status, is_verified)
-                VALUES (%s, 'instagram', %s, %s, %s, 'active', false)
-                ON CONFLICT (ceo_id, platform) DO NOTHING
-            """, (ceo_id, instagram_account_id, page_id, instagram_token))
+        # Always register the original page for the first user (cosmetic + routing)
+        cur.execute("""
+            INSERT INTO connected_platforms (ceo_id, platform, account_id, page_id, account_name, access_token, status, is_verified)
+            VALUES (%s, 'instagram', %s, %s, %s, %s, 'active', false)
+            ON CONFLICT (ceo_id, platform) DO UPDATE SET status='active', page_id=EXCLUDED.page_id
+        """, (ceo_id, instagram_account_id, page_id, "Instagram (Main)", instagram_token))
 
-            cur.execute("""
-                INSERT INTO connected_platforms (ceo_id, platform, account_id, page_id, access_token, status, is_verified)
-                VALUES (%s, 'facebook', %s, %s, %s, 'active', false)
-                ON CONFLICT (ceo_id, platform) DO NOTHING
-            """, (ceo_id, page_id, page_id, instagram_token))
+        cur.execute("""
+            INSERT INTO connected_platforms (ceo_id, platform, account_id, page_id, account_name, access_token, status, is_verified)
+            VALUES (%s, 'facebook', %s, %s, %s, %s, 'active', false)
+            ON CONFLICT (ceo_id, platform) DO UPDATE SET status='active', page_id=EXCLUDED.page_id
+        """, (ceo_id, page_id, page_id, "Facebook Page (Main)", instagram_token))
 
         # Add gmail from env
         gmail_address = first_user["email"]
@@ -1606,6 +1606,84 @@ def get_verification_status():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/meta/verification/check", methods=["POST"])
+@auth_required
+def check_verification_with_meta():
+    """
+    Attempt to check real verification status with Meta's Graph API.
+    Falls back to stored status if the token lacks business_management permission
+    (which requires Meta app review).
+    """
+    try:
+        ceo_id = request.user["user_id"]
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Get the CEO's stored facebook token
+        cur.execute("""
+            SELECT access_token, page_id FROM connected_platforms
+            WHERE ceo_id=%s AND platform='facebook' AND status='active' LIMIT 1
+        """, (ceo_id,))
+        row = cur.fetchone()
+
+        real_status = None
+        checked_with_meta = False
+
+        if row and row.get("access_token"):
+            token = row["access_token"]
+            # Try to query the business verification status
+            try:
+                # First get the business linked to this page
+                biz_res = requests.get(
+                    f"https://graph.facebook.com/v25.0/{row['page_id']}",
+                    params={"fields": "business", "access_token": token},
+                    timeout=10
+                ).json()
+                business = biz_res.get("business")
+                if business and business.get("id"):
+                    verify_res = requests.get(
+                        f"https://graph.facebook.com/v25.0/{business['id']}",
+                        params={"fields": "verification_status", "access_token": token},
+                        timeout=10
+                    ).json()
+                    if "verification_status" in verify_res:
+                        real_status = verify_res["verification_status"]
+                        checked_with_meta = True
+            except Exception as e:
+                print(f"⚠️ Meta verification check failed (likely missing permission): {e}")
+
+        # If we got a real status from Meta, update our DB to match
+        if checked_with_meta and real_status:
+            is_verified = real_status == "verified"
+            cur.execute("""
+                UPDATE users SET meta_verified=%s,
+                meta_verification_status=%s WHERE id=%s
+            """, (is_verified, real_status, ceo_id))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return jsonify({
+                "checked_with_meta": True,
+                "verification_status": real_status,
+                "meta_verified": is_verified
+            })
+
+        # Fallback — return stored status, note we couldn't reach Meta
+        cur.execute("SELECT meta_verified, meta_verification_status FROM users WHERE id=%s", (ceo_id,))
+        stored = cur.fetchone()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "checked_with_meta": False,
+            "note": "Real-time check requires Meta app review (business_management permission). Using recorded status.",
+            "verification_status": stored.get("meta_verification_status"),
+            "meta_verified": stored.get("meta_verified")
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/meta/verification/confirm", methods=["POST"])
 @auth_required
 def confirm_verification():
@@ -1745,6 +1823,28 @@ def facebook_oauth_callback():
         DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://vertex-ai-dashboard.vercel.app")
         return f"<script>window.location='{DASHBOARD_URL}?oauth_error=server_error'</script>"
 
+
+
+@app.route("/meta/verification/reset", methods=["POST"])
+@auth_required
+def reset_verification():
+    """Reset verification status back to not_started (for testing)"""
+    try:
+        ceo_id = request.user["user_id"]
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE users SET
+            meta_verified=FALSE,
+            meta_verification_status='not_started'
+            WHERE id=%s
+        """, (ceo_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"success": True, "meta_verified": False})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/onboarding/complete", methods=["POST"])
